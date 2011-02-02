@@ -537,6 +537,7 @@ int bam_pileup(int argc, char *argv[])
 
 typedef struct {
 	int max_mq, min_mq, flag, min_baseQ, capQ_thres, max_depth;
+	unsigned mincov, minfreq;
 	int openQ, extQ, tandemQ, min_support; // for indels
 	double min_frac; // for indels
 	char *reg, *fn_pos, *pl_list;
@@ -737,27 +738,33 @@ static int mpileup(mplp_conf_t *conf, int n, char **fn)
 		}
 		if (conf->flag & MPLP_GLF) {
 			int _ref0, ref16;
-			bcf1_t *b = calloc(1, sizeof(bcf1_t));
 			group_smpl(&gplp, sm, &buf, n, fn, n_plp, plp);
 			_ref0 = (ref && pos < ref_len)? ref[pos] : 'N';
 			ref16 = bam_nt16_table[_ref0];
 			for (i = 0; i < gplp.n; ++i)
 				bcf_call_glfgen(gplp.n_plp[i], gplp.plp[i], ref16, bca, bcr + i);
 			bcf_call_combine(gplp.n, bcr, ref16, &bc);
-			bcf_call2bcf(tid, pos, &bc, b, (conf->flag&(MPLP_FMT_DP|MPLP_FMT_SP))? bcr : 0,
-						 (conf->flag&MPLP_FMT_SP), 0, 0);
-			bcf_write(bp, bh, b);
-			bcf_destroy(b);
-			// call indels
-			if (!(conf->flag&MPLP_NO_INDEL) && bcf_call_gap_prep(gplp.n, gplp.n_plp, gplp.plp, pos, bca, ref, rghash) >= 0) {
-				for (i = 0; i < gplp.n; ++i)
-					bcf_call_glfgen(gplp.n_plp[i], gplp.plp[i], -1, bca, bcr + i);
-				if (bcf_call_combine(gplp.n, bcr, -1, &bc) >= 0) {
-					b = calloc(1, sizeof(bcf1_t));
-					bcf_call2bcf(tid, pos, &bc, b, (conf->flag&(MPLP_FMT_DP|MPLP_FMT_SP))? bcr : 0,
-								 (conf->flag&MPLP_FMT_SP), bca, ref);
-					bcf_write(bp, bh, b);
-					bcf_destroy(b);
+			unsigned altcov = bc.anno[2] + bc.anno[3];
+			unsigned cov = bc.anno[0] + bc.anno[1] + altcov;
+			unsigned freq = (cov == 0 ? 0 : 1000 * altcov / cov);
+			if (cov >= conf->mincov && freq >= conf->minfreq) {
+				bcf1_t *b = calloc(1, sizeof(bcf1_t));
+				bcf_call2bcf(tid, pos, &bc, b, (conf->flag&(MPLP_FMT_DP|MPLP_FMT_SP))? bcr : 0,
+							 (conf->flag&MPLP_FMT_SP), 0, 0);
+				bcf_write(bp, bh, b);
+				bcf_destroy(b);
+				// call indels
+				if (!(conf->flag&MPLP_NO_INDEL) && bcf_call_gap_prep(gplp.n, gplp.n_plp,
+							gplp.plp, pos, bca, ref, rghash) >= 0) {
+					for (i = 0; i < gplp.n; ++i)
+						bcf_call_glfgen(gplp.n_plp[i], gplp.plp[i], -1, bca, bcr + i);
+					if (bcf_call_combine(gplp.n, bcr, -1, &bc) >= 0) {
+						b = calloc(1, sizeof(bcf1_t));
+						bcf_call2bcf(tid, pos, &bc, b, (conf->flag&(MPLP_FMT_DP|MPLP_FMT_SP))? bcr : 0,
+									 (conf->flag&MPLP_FMT_SP), bca, ref);
+						bcf_write(bp, bh, b);
+						bcf_destroy(b);
+					}
 				}
 			}
 		} else {
@@ -864,12 +871,14 @@ int bam_mpileup(int argc, char *argv[])
 	memset(&mplp, 0, sizeof(mplp_conf_t));
 	mplp.max_mq = 60;
 	mplp.min_baseQ = 13;
+	mplp.mincov = 0;
+	mplp.minfreq = 0;
 	mplp.capQ_thres = 0;
 	mplp.max_depth = 250;
 	mplp.openQ = 40; mplp.extQ = 20; mplp.tandemQ = 100;
 	mplp.min_frac = 0.002; mplp.min_support = 1;
 	mplp.flag = MPLP_NO_ORPHAN | MPLP_REALN;
-	while ((c = getopt(argc, argv, "Agf:r:l:M:q:Q:uaRC:BDSd:b:P:o:e:h:Im:F:EG:")) >= 0) {
+	while ((c = getopt(argc, argv, "Agf:r:l:M:q:Q:uaRC:BDSd:b:P:o:e:h:Im:F:EG:c:V:")) >= 0) {
 		switch (c) {
 		case 'f':
 			mplp.fai = fai_load(optarg);
@@ -899,6 +908,8 @@ int bam_mpileup(int argc, char *argv[])
 		case 'A': use_orphan = 1; break;
 		case 'F': mplp.min_frac = atof(optarg); break;
 		case 'm': mplp.min_support = atoi(optarg); break;
+		case 'c': mplp.mincov = atoi(optarg); break;
+		case 'V': mplp.minfreq = atoi(optarg); break;
 		case 'G': {
 				FILE *fp_rg;
 				char buf[1024];
@@ -929,6 +940,8 @@ int bam_mpileup(int argc, char *argv[])
 		fprintf(stderr, "         -e INT      Phred-scaled gap extension seq error probability [%d]\n", mplp.extQ);
 		fprintf(stderr, "         -h INT      coefficient for homopolyer errors [%d]\n", mplp.tandemQ);
 		fprintf(stderr, "         -m INT      minimum gapped reads for indel candidates [%d]\n", mplp.min_support);
+		fprintf(stderr, "         -c UINT     filter below this coverage [%d]\n", mplp.mincov);
+		fprintf(stderr, "         -V UINT     filter if variant is below this promillage [%d]\n", mplp.minfreq);
 		fprintf(stderr, "         -F FLOAT    minimum fraction of gapped reads for candidates [%g]\n", mplp.min_frac);
 		fprintf(stderr, "         -G FILE     exclude read groups listed in FILE [null]\n");
 		fprintf(stderr, "         -A          use anomalous read pairs in SNP/INDEL calling\n");
